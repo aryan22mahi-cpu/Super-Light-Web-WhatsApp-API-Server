@@ -1,3 +1,4 @@
+require('dotenv').config({ path: require('path').join(__dirname, '../../.env') });
 /**
  * WhatsApp Service
  * Handles Baileys WhatsApp connection logic
@@ -16,6 +17,7 @@ const {
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
 const Session = require('../models/Session');
 const ActivityLog = require('../models/ActivityLog');
 
@@ -30,22 +32,49 @@ const retryCounters = new Map();
 // Auth directory
 const AUTH_DIR = path.join(__dirname, '../../auth_info_baileys');
 
-/**
- * Ensure auth directory exists
- */
 function ensureAuthDir() {
     if (!fs.existsSync(AUTH_DIR)) {
         fs.mkdirSync(AUTH_DIR, { recursive: true });
     }
 }
 
-/**
- * Connect to WhatsApp
- * @param {string} sessionId - Session ID
- * @param {function} onUpdate - Callback for status updates
- * @param {function} onMessage - Callback for incoming messages
- * @returns {object} Socket connection
- */
+async function callClaude(userMessage) {
+    return new Promise((resolve, reject) => {
+        const payload = JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 1024,
+            system: "You are DailyDesk, a helpful WhatsApp assistant. You are concise, friendly, and reply in the same language the user writes in. Keep responses short and to the point — this is WhatsApp, not email.",
+            messages: [{ role: "user", content: userMessage }]
+        });
+        const options = {
+            hostname: 'api.anthropic.com',
+            path: '/v1/messages',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': process.env.ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+                'Content-Length': Buffer.byteLength(payload)
+            }
+        };
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    const result = JSON.parse(data);
+                    resolve(result.content[0].text);
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        });
+        req.on('error', reject);
+        req.write(payload);
+        req.end();
+    });
+}
+
 async function connect(sessionId, onUpdate, onMessage) {
     if (!require('../utils/validation').isValidId(sessionId)) {
         throw new Error('Invalid session ID');
@@ -58,13 +87,11 @@ async function connect(sessionId, onUpdate, onMessage) {
         fs.mkdirSync(sessionDir, { recursive: true });
     }
 
-    // Update session status
     Session.updateStatus(sessionId, 'CONNECTING', 'Initializing...');
     if (onUpdate) onUpdate(sessionId, 'CONNECTING', 'Initializing...', null);
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
-    // Get latest WA version (with fallback)
     let version;
     try {
         const waVersion = await fetchLatestWaWebVersion({});
@@ -98,13 +125,10 @@ async function connect(sessionId, onUpdate, onMessage) {
         getMessage: async () => ({ conversation: 'hello' })
     });
 
-    // Store socket reference
     activeSockets.set(sessionId, sock);
 
-    // Handle credentials update
     sock.ev.on('creds.update', saveCreds);
 
-    // Handle connection updates
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
@@ -121,7 +145,6 @@ async function connect(sessionId, onUpdate, onMessage) {
         if (connection === 'open') {
             console.log(`[${sessionId}] Connected!`);
             retryCounters.delete(sessionId);
-
             const name = sock.user?.name || 'Unknown';
             Session.updateStatus(sessionId, 'CONNECTED', `Connected as ${name}`);
             if (onUpdate) onUpdate(sessionId, 'CONNECTED', `Connected as ${name}`, null);
@@ -135,7 +158,6 @@ async function connect(sessionId, onUpdate, onMessage) {
             Session.updateStatus(sessionId, 'DISCONNECTED', reason);
             if (onUpdate) onUpdate(sessionId, 'DISCONNECTED', reason, null);
 
-            // Handle reconnection logic
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401 && statusCode !== 403;
 
             if (shouldReconnect) {
@@ -150,7 +172,6 @@ async function connect(sessionId, onUpdate, onMessage) {
                     retryCounters.delete(sessionId);
                 }
             } else {
-                // Clear session data on logout
                 if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                     console.log(`[${sessionId}] Logged out, cleaning session data`);
                     if (fs.existsSync(sessionDir)) {
@@ -163,23 +184,30 @@ async function connect(sessionId, onUpdate, onMessage) {
         }
     });
 
-    // Handle incoming messages
-    if (onMessage) {
-        sock.ev.on('messages.upsert', async (m) => {
-            const msg = m.messages[0];
-            if (!msg.key.fromMe && msg.message) {
-                onMessage(sessionId, msg);
+    // Handle incoming messages - call Claude and reply
+    sock.ev.on('messages.upsert', async (m) => {
+        const msg = m.messages[0];
+        if (!msg.key.fromMe && msg.message) {
+            if (onMessage) onMessage(sessionId, msg);
+
+            const userText = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+            if (!userText) return;
+
+            console.log(`[${sessionId}] Received: ${userText}`);
+
+            try {
+                const reply = await callClaude(userText);
+                await sock.sendMessage(msg.key.remoteJid, { text: reply });
+                console.log(`[${sessionId}] Replied: ${reply.substring(0, 50)}`);
+            } catch (e) {
+                console.error(`[${sessionId}] Claude error: ${e.message}`);
             }
-        });
-    }
+        }
+    });
 
     return sock;
 }
 
-/**
- * Disconnect a session
- * @param {string} sessionId - Session ID
- */
 function disconnect(sessionId) {
     const sock = activeSockets.get(sessionId);
     if (sock) {
@@ -189,29 +217,15 @@ function disconnect(sessionId) {
     retryCounters.delete(sessionId);
 }
 
-/**
- * Get socket for a session
- * @param {string} sessionId - Session ID
- * @returns {object|null} Socket or null
- */
 function getSocket(sessionId) {
     return activeSockets.get(sessionId) || null;
 }
 
-/**
- * Check if session is connected
- * @param {string} sessionId - Session ID
- * @returns {boolean} True if connected
- */
 function isConnected(sessionId) {
     const sock = activeSockets.get(sessionId);
     return sock?.user != null;
 }
 
-/**
- * Delete session data
- * @param {string} sessionId - Session ID
- */
 function deleteSessionData(sessionId) {
     if (!require('../utils/validation').isValidId(sessionId)) {
         return;
@@ -227,10 +241,6 @@ function deleteSessionData(sessionId) {
     Session.delete(sessionId);
 }
 
-/**
- * Get all active sessions
- * @returns {Map} Active sockets
- */
 function getActiveSessions() {
     return activeSockets;
 }
